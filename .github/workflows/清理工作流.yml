@@ -15,7 +15,7 @@ on:
         description: "保留最近工作流的天数/数量（输入数字）"
         required: true
         type: string
-        default: "10"   # 建议改成 10，避免误删所有
+        default: "10"   # 建议修改默认值，避免误删
 
 jobs:
   clean:
@@ -25,11 +25,11 @@ jobs:
       contents: read
 
     steps:
-      - name: 安装 gh 并列出所有运行
+      - name: 安装 gh 并清理
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 安装 gh
+          # 安装 GitHub CLI
           type -p gh >/dev/null || (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
           sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
           echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
@@ -40,14 +40,14 @@ jobs:
           mode="${{ github.event.inputs.clean_mode }}"
           keep_val="${{ github.event.inputs.clean_to_keep }}"
 
-          # 获取所有运行（排除当前），按时间降序，自动处理分页
-          all_runs_json=$(gh run list --repo "$repo" --limit 1000 --json id,createdAt,status \
-            | jq --arg cur "$current_run" '[.[] | select(.id != ($cur | tonumber))] | sort_by(.createdAt) | reverse')
+          # 获取所有运行（排除当前），按创建时间降序，使用 databaseId
+          all_runs_json=$(gh run list --repo "$repo" --limit 1000 --json databaseId,createdAt,status \
+            | jq --arg cur "$current_run" '[.[] | select(.databaseId != ($cur | tonumber))] | sort_by(.createdAt) | reverse')
           
           total=$(echo "$all_runs_json" | jq length)
           echo "当前仓库共有 $total 个可清理的运行（不含本次触发）"
 
-          if [ "$total" -eq 0 ]; then
+          if [ "$total" -eq 0 ] || [ -z "$total" ]; then
             echo "没有需要处理的运行"
             exit 0
           fi
@@ -59,14 +59,14 @@ jobs:
               echo "保留数量 ($keep) 大于等于总数 ($total)，无需删除"
               exit 0
             fi
-            # 获取待删除的 ID（从第 keep+1 个到末尾）
-            delete_ids=$(echo "$all_runs_json" | jq -r '.['$keep':] | .[].id')
+            # 获取待删除的 databaseId（从第 keep+1 个到末尾）
+            delete_ids=$(echo "$all_runs_json" | jq -r '.['$keep':] | .[].databaseId')
             echo "将保留最近 $keep 个，删除其余 $((total - keep)) 个"
           else
             # 日期模式
             cutoff=$(date -d "$keep_val days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
             echo "截止日期: $cutoff"
-            delete_ids=$(echo "$all_runs_json" | jq -r --arg cut "$cutoff" '.[] | select(.createdAt < $cut) | .id')
+            delete_ids=$(echo "$all_runs_json" | jq -r --arg cut "$cutoff" '.[] | select(.createdAt < $cut) | .databaseId')
             if [ -z "$delete_ids" ]; then
               echo "没有早于 $cutoff 的运行，无需删除"
               exit 0
@@ -76,6 +76,11 @@ jobs:
 
           # 打印并执行删除
           echo "待删除 ID: $(echo $delete_ids | tr '\n' ' ')"
+          if [ -z "$delete_ids" ]; then
+            echo "没有需要删除的运行"
+            exit 0
+          fi
+
           for id in $delete_ids; do
             echo "正在删除 $id ..."
             gh run delete "$id" --repo "$repo" --confirm

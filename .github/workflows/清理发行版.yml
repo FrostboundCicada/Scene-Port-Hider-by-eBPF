@@ -1,0 +1,93 @@
+name: 清理发行版
+
+on:
+  workflow_dispatch:
+    inputs:
+      clean_mode:
+        description: "清理模式 (amount--保留数量, date--保留天数)"
+        required: true
+        type: choice
+        default: 'amount'
+        options:
+          - 'amount'
+          - 'date'
+      clean_to_keep:
+        description: "保留最近发行的数量/天数（输入数字）"
+        required: true
+        type: string
+        default: "10"
+
+jobs:
+  clean-releases:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # 删除 Release 需要 contents:write
+    steps:
+      - name: 安装 GitHub CLI
+        run: |
+          type -p gh >/dev/null || (curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg && \
+          sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null && \
+          sudo apt update && sudo apt install -y gh)
+          gh --version
+
+      - name: 按配置清理 Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          mode="${{ github.event.inputs.clean_mode }}"
+          keep_val="${{ github.event.inputs.clean_to_keep }}"
+
+          # 获取所有 Release（包含 draft 和 prerelease），按创建时间降序
+          # 使用 --limit 1000 确保尽量全部获取（若超1000可循环分页，通常足够）
+          all_releases_json=$(gh release list --repo "$repo" --limit 1000 --json tagName,createdAt,isDraft,isPrerelease \
+            | jq 'sort_by(.createdAt) | reverse')
+          
+          total=$(echo "$all_releases_json" | jq length)
+          echo "当前仓库共有 $total 个发行版"
+
+          if [ "$total" -eq 0 ] || [ -z "$total" ]; then
+            echo "没有发行版需要处理"
+            exit 0
+          fi
+
+          if [ "$mode" = "amount" ]; then
+            # 保留数量模式
+            keep=$((keep_val > 0 ? keep_val : 0))
+            if [ "$keep" -ge "$total" ]; then
+              echo "保留数量 ($keep) 大于等于总数 ($total)，无需删除"
+              exit 0
+            fi
+            # 获取待删除的 tagName（从第 keep+1 个开始）
+            delete_tags=$(echo "$all_releases_json" | jq -r '.['$keep':] | .[].tagName')
+            echo "将保留最近 $keep 个，删除其余 $((total - keep)) 个"
+          else
+            # 天数模式
+            cutoff=$(date -d "$keep_val days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
+            echo "截止日期: $cutoff"
+            delete_tags=$(echo "$all_releases_json" | jq -r --arg cut "$cutoff" '.[] | select(.createdAt < $cut) | .tagName')
+            if [ -z "$delete_tags" ]; then
+              echo "没有早于 $cutoff 的发行版，无需删除"
+              exit 0
+            fi
+            echo "将删除早于 $cutoff 的发行版"
+          fi
+
+          if [ -z "$delete_tags" ]; then
+            echo "没有需要删除的发行版"
+            exit 0
+          fi
+
+          echo "待删除的 Release 标签: $(echo $delete_tags | tr '\n' ' ')"
+          for tag in $delete_tags; do
+            echo "正在删除 Release: $tag ..."
+            # 使用 --yes 跳过确认，--repo 指定仓库
+            gh release delete "$tag" --repo "$repo" --yes
+            if [ $? -eq 0 ]; then
+              echo "✅ 成功删除 $tag"
+            else
+              echo "❌ 删除 $tag 失败（可能已被删除或权限不足）"
+            fi
+          done
+          echo "清理完成！"
